@@ -45,6 +45,7 @@ const filter = atom({ plugin: 'work-lens', key: 'filter' } as const, 'all')
 const toggled = atom({ plugin: 'work-lens', key: 'toggled' } as const, {})
 const calls = atom({ plugin: 'work-lens', key: 'calls' } as const, { tried: 0, answered: 0 })
 const anchor = atom({ plugin: 'work-lens', key: 'anchor' } as const, null)
+const backfilled = atom({ plugin: 'work-lens', key: 'backfilled' } as const, false)
 
 type Engine = EngineInterface
 
@@ -162,6 +163,33 @@ async function scanOnce($: Engine, isClosing: boolean) {
     await enqueue($, closed)
     if (!isFull || closed.length === 0) return
   }
+}
+
+/**
+ * Lists the rows from before the mod started (a resumed session, or the mod loaded mid-session) as steps marked
+ * "earlier history": no model call, but collapsible like any other, so old work folds too. They go before the
+ * steps already listed and every step is renumbered. Up to the newest 4,096 rows, through the anchor.
+ */
+async function backfill($: Engine) {
+  if (await read($, backfilled)) return
+  const upTo = await read($, anchor)
+  if (upTo === null) return
+  const res = await $.session.messages({ last: PAGE_ROWS })
+  // A failed or refused read leaves the flag unset, so the next start tries again.
+  if (!Array.isArray(res)) return
+  const rows = res as unknown as Row[]
+  const end = rows.findIndex(r => r.uuid === upTo)
+  // Anchor outside the newest 4,096 rows: every row in reach is already a step, and older rows cannot be read
+  // with ids (a ranged read reaches the newest 4,096 only). Nothing more to do (plan item 46).
+  const old = end < 0 ? [] : split(rows.slice(0, end + 1)).filter(isWorthListing)
+  await update($, backfilled, () => true)
+  if (old.length === 0) return
+  await update($, steps, list => {
+    const known = new Set(list.map(s => s.id))
+    const earlier = old.filter(s => !known.has(s.id)).map(s => mark(s, 'skipped', 'earlier history'))
+
+    return [...earlier, ...list].map((s, i) => ({ ...s, n: i + 1 }))
+  })
 }
 
 /** At the session's end: what was never scanned is still listed, every step of it skipped, with no call. */
@@ -326,7 +354,8 @@ function noteSurface(e: { viewport?: { isFullscreen?: boolean } }) {
   if (e.viewport?.isFullscreen !== undefined) S.isFullscreen = e.viewport.isFullscreen
 }
 
-const isCollapsible = (s: Step) => s.status === 'done'
+/** Every step that has finished its turn in the queue folds: summarized, skipped or unavailable alike. */
+const isCollapsible = (s: Step) => s.status === 'done' || s.status === 'skipped' || s.status === 'unavailable'
 
 /** How one transcript site draws: as itself, with the step's header, as the header alone, or not at all. */
 type SiteView =
@@ -429,6 +458,7 @@ export const register: Register = (on, options) => {
       argumentHint: '[all|positive|neutral|negative|planned|new|fix|<category>|summarize]',
     })
     if ((await read($, anchor)) === null) await setAnchorToNewest($)
+    await backfill($).catch(() => undefined)
     void work($)
 
     return result
@@ -442,6 +472,7 @@ export const register: Register = (on, options) => {
       // The process goes on under a new session: start the log over.
       await update($, steps, () => [])
       await update($, anchor, () => null)
+      await update($, backfilled, () => false)
       await update($, calls, () => ({ tried: 0, answered: 0 }))
       S.cont = undefined
       S.isEnded = false
@@ -517,6 +548,15 @@ export const register: Register = (on, options) => {
     const text = e.props.text
 
     return drawSite($, e, [e.requestId], () => next(e), s => isOpeningBlock(s, text))
+  })
+
+  // A tool's output (Bash stdout, an edit's diff, a file read) draws as its own row under the call: it folds and
+  // filters with its step, never carries the header, and ctrl+o (isExpanded) shows it in full.
+  on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
+    noteSurface(e)
+    if (e.props.isExpanded) return next(e)
+
+    return drawSite($, e, [e.requestId], () => next(e), () => false)
   })
 
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {

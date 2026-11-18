@@ -42,6 +42,8 @@ declare module 'claude-code' {
       calls: { tried: number; answered: number }
       /** The uuid of the last row already split into closed steps; null before the first scan. */
       anchor: string | null
+      /** Whether the rows from before the mod started have been listed (as collapsed "earlier history" steps). */
+      backfilled: boolean
     }
   }
 }

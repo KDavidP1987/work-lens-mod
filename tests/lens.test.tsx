@@ -95,6 +95,8 @@ type Fake = {
   /** The log lines the mod printed. */
   logs: string[]
   plan?: string
+  /** True: the 4,096-row history read is refused. */
+  isHistoryDown?: boolean
 }
 
 const answer = (summary: string, kind = 'new', category = 'code', relates: string | null = null) =>
@@ -117,6 +119,8 @@ function engine(on: any, f: Fake) {
   on('session.end', () => ({ sessionId: 'me-session' }))
   on('turn.complete', () => ({ text: '' }))
   on('session.messages', (_: unknown, e: { last?: number; after?: string }) => {
+    // A history read (the 4,096-row window) refused while the fake says history is down.
+    if (e.last === 4096 && f.isHistoryDown === true) return { value: { deny: 'unavailable' } }
     if (e.last !== undefined) return { value: f.rows.slice(-e.last) }
     f.reads.push(e.after!)
     const at = f.rows.findIndex(r => r.uuid === e.after)
@@ -142,7 +146,8 @@ function engine(on: any, f: Fake) {
 }
 
 const fake = (over: Partial<Fake> = {}): Fake => ({
-  rows: [say('a0', 'Earlier work.')],
+  // Opens on a bare prompt: no earlier work, so no "earlier history" step shifts the numbering.
+  rows: [prompt('a0', 'hello')],
   replies: [],
   calls: 0,
   maxInFlight: 0,
@@ -563,6 +568,80 @@ test('markers are colored by valence, and every count in the band is a filter th
   await ui.unmount()
   out = ((await $.command.run(worklog())) as { text: string }).text
   expect(out).toContain('filter: all · 3 steps')
+})
+
+test('collapsed steps fold their tool output too; ctrl+o still shows it', async ($, on) => {
+  const f = fake()
+  engine(on, f)
+  on('ui.render', { plugin: '*' }, ($$: any, e: any) => $$.ui.resolve(e).Text({ children: `ORIGINAL ${e.requestId}` }))
+  await $.session.start(START)
+  f.rows.push(say('a1', 'Running the build.', [use('t1')]), result('u1', 't1'))
+  f.replies.push(answer('Ran the build', 'new', 'code'))
+  await $.turn.complete(DONE)
+  await settle()
+  const out = (isExpanded?: boolean) =>
+    ({
+      plugin: 'work-lens',
+      component: 'ToolResult',
+      requestId: 't1',
+      surface: 'terminal',
+      viewport: FULL,
+      props: { tool_use_id: 't1', tool: 'Bash', output: { stdout: 'x'.repeat(500) }, isErrored: false, isExpanded },
+    }) as any
+  let ui = await $.ui.mount(out())
+  expect(await ui.find({ type: 'Text', text: /ORIGINAL t1/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button' })).toBeUndefined()
+  await ui.unmount()
+  ui = await $.ui.mount(out(true))
+  expect(await ui.find({ type: 'Text', text: /ORIGINAL t1/ })).toBeDefined()
+  await ui.unmount()
+  // Expanded by its header: the output shows.
+  ui = await $.ui.mount(msg('a1', 'Running the build.'))
+  await ui.press({ key: 'wl-a1' })
+  await ui.unmount()
+  ui = await $.ui.mount(out())
+  expect(await ui.find({ type: 'Text', text: /ORIGINAL t1/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('work from before the mod started folds as "earlier history", with no model call', async ($, on) => {
+  const f = fake({ rows: [prompt('p0', 'start'), say('h1', 'Old work one.', [use('ht1')]), result('hu1', 'ht1'), say('h2', 'Old work two.')] })
+  engine(on, f)
+  on('ui.render', { plugin: '*' }, ($$: any, e: any) => $$.ui.resolve(e).Text({ children: `ORIGINAL ${e.requestId}` }))
+  await $.session.start(START)
+  f.rows.push(say('a1', 'New work.'))
+  f.replies.push(answer('Did new work', 'new', 'code'))
+  await $.turn.complete(DONE)
+  await settle()
+  expect(f.calls).toBe(1)
+  const text = ((await $.command.run(worklog())) as { text: string }).text
+  expect(text).toContain('#1 · skipped (earlier history)')
+  expect(text).toContain('#2 · skipped (earlier history)')
+  expect(text).toContain('#3 ◆ code · Did new work')
+  // The old step draws as its header alone; its tool row and output draw nothing.
+  let ui = await $.ui.mount(msg('h1', 'Old work one.'))
+  expect((await ui.find({ type: 'Button' }))?.text).toContain('earlier history')
+  expect(await ui.find({ type: 'Text', text: /ORIGINAL/ })).toBeUndefined()
+  await ui.unmount()
+  ui = await $.ui.mount(toolRow('ht1'))
+  expect(await ui.find({ type: 'Text', text: /ORIGINAL/ })).toBeUndefined()
+  await ui.unmount()
+  // A second start (a reload) lists nothing twice.
+  await $.session.start(START)
+  expect(((await $.command.run(worklog())) as { text: string }).text).toContain('· 3 steps')
+})
+
+test('a failed history read is retried at the next start, not given up', async ($, on) => {
+  const f = fake({ rows: [prompt('p0', 'start'), say('h1', 'Old work one.')] })
+  f.isHistoryDown = true
+  engine(on, f)
+  await $.session.start(START)
+  await settle()
+  expect(((await $.command.run(worklog())) as { text: string }).text).not.toContain('earlier history')
+  f.isHistoryDown = false
+  await $.session.start(START)
+  await settle()
+  expect(((await $.command.run(worklog())) as { text: string }).text).toContain('skipped (earlier history)')
 })
 
 test('split: a tool result never pushes a part past 300 rows', () => {
