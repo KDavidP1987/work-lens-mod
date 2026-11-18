@@ -1,0 +1,47 @@
+{
+  "name": "work-lens",
+  "version": "0.2.0",
+  "description": "Summarizes each step of work into a one-line, collapsible, filterable entry: category, plan item, and a planned / new / fix marker.",
+  "author": { "name": "SkillEra IO, LLC" },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "categories": {
+      "type": "string",
+      "title": "Categories",
+      "description": "Comma-separated work categories the summaries are sorted into.",
+      "default": "notes, backlog & artifacts, code, auditing, evaluating"
+    },
+    "neutralCategories": {
+      "type": "string",
+      "title": "Neutral categories",
+      "description": "Comma-separated categories counted as neutral (gray): upkeep that adds no direct value. Fixes are negative (red); everything else is positive (green).",
+      "default": "notes"
+    },
+    "model": {
+      "type": "string",
+      "title": "Model",
+      "description": "Model that writes the summaries (each step is one small extra request, shown in /cost).",
+      "options": ["haiku", "sonnet"],
+      "default": "haiku"
+    },
+    "autoSummarize": {
+      "type": "boolean",
+      "title": "Summarize automatically",
+      "description": "Off: nothing is sent until you run /worklog summarize.",
+      "default": true
+    },
+    "collapseByDefault": {
+      "type": "boolean",
+      "title": "Collapse steps by default",
+      "description": "Fullscreen layout: a summarized step shows as its one-line header until you press it.",
+      "default": true
+    },
+    "maxCalls": {
+      "type": "number",
+      "title": "Call cap per session",
+      "description": "Every model attempt counts, retries included.",
+      "default": 200
+    }
+  }
+}

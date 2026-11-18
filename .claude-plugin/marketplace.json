@@ -1,0 +1,13 @@
+{
+  "name": "work-lens-mod",
+  "owner": { "name": "SkillEra IO, LLC", "url": "https://skillera.io" },
+  "plugins": [
+    {
+      "name": "work-lens",
+      "source": "./",
+      "description": "Turns the transcript's wall of text into a work log: each step gets a one-line, collapsible summary with a category, plan item and a color-coded planned / new / fix marker, filterable from the line above the prompt.",
+      "version": "0.2.0",
+      "category": "productivity"
+    }
+  ]
+}
