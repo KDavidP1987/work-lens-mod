@@ -97,6 +97,8 @@ type Fake = {
   plan?: string
   /** True: the 4,096-row history read is refused. */
   isHistoryDown?: boolean
+  /** True: every read throws. */
+  isHistoryBroken?: boolean
 }
 
 const answer = (summary: string, kind = 'new', category = 'code', relates: string | null = null) =>
@@ -120,6 +122,7 @@ function engine(on: any, f: Fake) {
   on('turn.complete', () => ({ text: '' }))
   on('session.messages', (_: unknown, e: { last?: number; after?: string }) => {
     // A history read (the 4,096-row window) refused while the fake says history is down.
+    if (f.isHistoryBroken === true) throw new Error('history read failed')
     if (e.last === 4096 && f.isHistoryDown === true) return { value: { deny: 'unavailable' } }
     if (e.last !== undefined) return { value: f.rows.slice(-e.last) }
     f.reads.push(e.after!)
@@ -631,6 +634,93 @@ test('work from before the mod started folds as "earlier history", with no model
   expect(((await $.command.run(worklog())) as { text: string }).text).toContain('· 3 steps')
 })
 
+test('a compaction: the work before it is read first and folds; the rows after it are not skipped', async ($, on) => {
+  const f = fake()
+  engine(on, f)
+  on('session.compact', (_: unknown, e: any) => ({ messages: e.messages }))
+  on('ui.render', { plugin: '*' }, ($$: any, e: any) => $$.ui.resolve(e).Text({ children: `ORIGINAL ${e.requestId}` }))
+  await $.session.start(START)
+  f.rows.push(say('a1', 'Editing the readme.', [use('t1')]), result('u1', 't1'))
+  f.replies.push(answer('Edited the readme', 'new', 'notes'), answer('Kept going', 'new', 'code'))
+  await $.session.compact({ trigger: 'auto', messages: [prompt('c0', 'summary of the conversation')] } as any)
+  // The compaction drops every earlier row; the conversation now starts at its summary.
+  f.rows.splice(0, f.rows.length, prompt('c0', 'summary of the conversation'))
+  f.rows.push(say('a2', 'Kept going after it.'))
+  await $.turn.complete(DONE)
+  await settle()
+  const text = ((await $.command.run(worklog())) as { text: string }).text
+  expect(text).toContain('Edited the readme')
+  expect(text).toContain('Kept going')
+  expect(f.logs.join('\n')).not.toContain('compaction removed')
+  // The pre-compaction step's diff folds under its header.
+  const ui = await $.ui.mount({
+    plugin: 'work-lens',
+    component: 'ToolResult',
+    requestId: 't1',
+    surface: 'terminal',
+    viewport: FULL,
+    props: { tool_use_id: 't1', tool: 'Edit', output: {}, isErrored: false },
+  } as any)
+  expect(await ui.find({ type: 'Text', text: /ORIGINAL/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a compaction the mod did not see: the rows after it are still listed, the notice is said once', async ($, on) => {
+  const f = fake()
+  engine(on, f)
+  await $.session.start(START)
+  f.rows.push(say('a1', 'Before.'))
+  await $.turn.complete(DONE)
+  f.rows.splice(0, f.rows.length, prompt('c0', 'summary'), say('a2', 'After one.'), prompt('p1', 'go on'))
+  f.rows.push(say('a3', 'After two.'))
+  await $.turn.complete(DONE)
+  await $.turn.complete(DONE)
+  await settle()
+  const text = ((await $.command.run(worklog())) as { text: string }).text
+  expect(text).toContain('· 3 steps')
+  expect(f.logs.filter(l => l.includes('compaction removed')).length).toBe(1)
+})
+
+test('the notice is hidden only for the anchor a successful pre-compaction read reached', async ($, on) => {
+  const f = fake()
+  engine(on, f)
+  on('session.compact', (_: unknown, e: any) => ({ messages: e.messages }))
+  await $.session.start(START)
+  // A compaction that keeps the anchor, then later work and an unseen compaction: the notice is said.
+  f.rows.push(say('a1', 'One.'))
+  await $.session.compact({ trigger: 'auto', messages: [prompt('c0', 's')] } as any)
+  f.rows.push(say('a2', 'Two.'))
+  await $.turn.complete(DONE)
+  f.rows.splice(0, f.rows.length, prompt('c1', 's2'), say('a3', 'Three.'))
+  await $.turn.complete(DONE)
+  await settle()
+  expect(f.logs.filter(l => l.includes('compaction removed')).length).toBe(1)
+  // A pre-compaction read that fails leaves the notice on.
+  f.rows.push(say('a4', 'Four.'))
+  f.isHistoryBroken = true
+  await $.session.compact({ trigger: 'auto', messages: [prompt('c2', 's3')] } as any)
+  f.isHistoryBroken = false
+  f.rows.splice(0, f.rows.length, prompt('c3', 's4'), say('a5', 'Five.'))
+  await $.turn.complete(DONE)
+  await settle()
+  expect(f.logs.filter(l => l.includes('compaction removed')).length).toBe(2)
+})
+
+test('a compaction that keeps only rows already listed: nothing doubles, the notice is said once', async ($, on) => {
+  const f = fake()
+  engine(on, f)
+  await $.session.start(START)
+  f.rows.push(say('a1', 'One.'), say('a2', 'Two.'))
+  await $.turn.complete(DONE)
+  // The anchor (a2) is dropped; a1 is kept behind the summary. Nothing new to read, twice.
+  f.rows.splice(0, f.rows.length, prompt('c0', 'summary'), say('a1', 'One.'))
+  await $.turn.complete(DONE)
+  await $.turn.complete(DONE)
+  await settle()
+  expect(((await $.command.run(worklog())) as { text: string }).text).toContain('· 2 steps')
+  expect(f.logs.filter(l => l.includes('compaction removed')).length).toBe(1)
+})
+
 test('a failed history read is retried at the next start, not given up', async ($, on) => {
   const f = fake({ rows: [prompt('p0', 'start'), say('h1', 'Old work one.')] })
   f.isHistoryDown = true
@@ -656,16 +746,17 @@ test('split: a tool result never pushes a part past 300 rows', () => {
   expect(steps.reduce((n, s) => n + s.rows.length, 0)).toBe(rows.length)
 })
 
-test('an anchor lost to compaction resets without a crash', async ($, on) => {
+test('an anchor lost to compaction resets without a crash, and the rows since it are read', async ($, on) => {
   const f = fake()
   engine(on, f)
   await $.session.start(START)
   f.rows = [say('z1', 'After compaction.')]
   await $.turn.complete(DONE)
   await settle()
-  expect(f.calls).toBe(0)
+  // 0.3.1: the rows written since the compaction are no longer skipped.
+  expect(f.calls).toBe(1)
   f.rows.push(say('z2', 'New work.'))
   await $.turn.complete(DONE)
   await settle()
-  expect(f.calls).toBe(1)
+  expect(f.calls).toBe(2)
 })

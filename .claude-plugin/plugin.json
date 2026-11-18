@@ -1,6 +1,6 @@
 {
   "name": "work-lens",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Summarizes each step of work into a one-line, collapsible, filterable entry: category, plan item, and a planned / new / fix marker.",
   "author": { "name": "SkillEra IO, LLC" },
   "license": "MIT",

@@ -6,7 +6,7 @@
       "name": "work-lens",
       "source": "./",
       "description": "Turns the transcript's wall of text into a work log: each step gets a one-line, collapsible summary with a category, plan item and a color-coded planned / new / fix marker, filterable from the line above the prompt.",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "category": "productivity"
     }
   ]

@@ -30,7 +30,8 @@ click it (or focus the line with ctrl+x tab) to show only those steps; click it 
   default: its text, its tool calls and their output (command output, diffs, file reads) all fold into that one
   line. Press it to expand or collapse. The step in progress stays open until its summary arrives. Work from
   before the mod started (a resumed session) folds too, as "earlier history" steps; `/worklog summarize` labels
-  them if you want (each is one model call). `/worklog` opens the *Work log* pane: filter buttons per category and
+  them if you want (each is one model call). Before the conversation compacts, the mod reads every step up to
+  that point, so the work still on screen after a compaction folds too. `/worklog` opens the *Work log* pane: filter buttons per category and
   per marker (hotkeys 1-9) and the list of steps. A filter hides every step outside it, text and tool rows alike;
   the line above the prompt says how many are hidden. A grouped tool row that holds calls of two steps stays
   visible while either step is shown.

@@ -65,6 +65,10 @@ const S = {
   isWorking: false,
   stop: null as AbortController | null,
   isFullscreen: undefined as boolean | undefined,
+  /** The anchor the compaction hook's scan reached, set only when that scan succeeded. */
+  compactionAnchor: null as string | null,
+  /** The anchor a compaction removed, so its notice is logged once. */
+  lostAnchor: null as string | null,
   plan: { text: '', at: 0 },
   index: new WeakMap<readonly Step[], Map<string, Step>>(),
 }
@@ -141,14 +145,25 @@ async function scanOnce($: Engine, isClosing: boolean) {
     let from = await read($, anchor)
     if (from === null) from = await setAnchorToNewest($)
     if (from === null) return
-    const res = await $.session.messages({ after: from })
+    let res = await $.session.messages({ after: from })
     if (!Array.isArray(res)) {
-      // The anchor fell to a compaction: start again from the newest row.
+      // The anchor fell to a compaction. The rows the conversation still holds (the newest 4,096) are read and
+      // every one no step owns yet is split, so the rows written since the compaction are not skipped.
       S.cont = undefined
-      await setAnchorToNewest($)
-      $.ui.log('work-lens: a compaction removed rows before they were summarized; those steps are skipped')
+      const kept = await $.session.messages({ last: PAGE_ROWS })
+      if (!Array.isArray(kept)) {
+        await setAnchorToNewest($)
 
-      return
+        return
+      }
+      const owned = new Set((await read($, steps)).flatMap(s => s.rows))
+      res = (kept as unknown as Row[]).filter(r => r.uuid === undefined || !owned.has(r.uuid)) as unknown as typeof res
+      // Said once per lost anchor, and not when the compaction hook's scan reached exactly this anchor.
+      if (S.compactionAnchor !== from && S.lostAnchor !== from) {
+        $.ui.log('work-lens: a compaction removed rows before they were read; those steps are not listed')
+      }
+      S.lostAnchor = from
+      S.compactionAnchor = null
     }
     const rows = res as unknown as Row[]
     const isFull = rows.length >= PAGE_ROWS
@@ -502,6 +517,24 @@ export const register: Register = (on, options) => {
     }
 
     return result
+  })
+
+  // Before the main conversation compacts, every row up to now is split into closed steps, so the work still on
+  // screen after the compaction belongs to steps that fold (their text is kept in state; summaries need no rows).
+  on('session.compact', async ($, e, next) => {
+    if (e.agentId === undefined && e.trigger !== 'precompute' && !S.isEnded) {
+      S.timer?.cancel()
+      S.timer = null
+      S.compactionAnchor = null
+      try {
+        await scan($, true)
+        S.compactionAnchor = await read($, anchor)
+      } catch {
+        // The scan failed: the notice stays on for whatever the compaction removes.
+      }
+    }
+
+    return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
