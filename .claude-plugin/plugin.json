@@ -1,6 +1,6 @@
 {
   "name": "work-lens",
-  "version": "0.3.1",
+  "version": "0.5.2",
   "description": "Summarizes each step of work into a one-line, collapsible, filterable entry: category, plan item, and a planned / new / fix marker.",
   "author": { "name": "SkillEra IO, LLC" },
   "license": "MIT",
@@ -35,6 +35,37 @@
       "type": "boolean",
       "title": "Collapse steps by default",
       "description": "Fullscreen layout: a summarized step shows as its one-line header until you press it.",
+      "default": true
+    },
+    "labelDetail": {
+      "type": "string",
+      "title": "Label detail",
+      "description": "grouped: one chip per label group (Needs you, Review, Purpose, Work); press one to open its labels. all: every label as its own chip, side by side, value (▲ positive, ■ neutral, ▼ negative) included: the layout before 0.5.1.",
+      "options": ["grouped", "all"],
+      "default": "grouped"
+    },
+    "labelGroups": {
+      "type": "string",
+      "title": "Groups shown",
+      "description": "Comma-separated label groups drawn on rows, chips and /worklog lines: needs, review, purpose, work. Display only: what is sent to the model is unchanged (see judgeRules and sendFailureText).",
+      "default": "needs, review, purpose, work"
+    },
+    "outwardPatterns": {
+      "type": "string",
+      "title": "Extra outward patterns",
+      "description": "Comma-separated regular expressions over a parsed shell command; a match marks the step ⇪ outward (sent off this machine). Invalid ones are left out and logged.",
+      "default": ""
+    },
+    "judgeRules": {
+      "type": "boolean",
+      "title": "Judge rule breaks and assumptions",
+      "description": "Sends an excerpt of your standing rules (CLAUDE.md files, feedback memories, hook names) and your latest typed message with each summary, and asks for ⚑ deviation and ◇ assumption. Off: neither is sent or asked.",
+      "default": true
+    },
+    "sendFailureText": {
+      "type": "boolean",
+      "title": "Send failure text",
+      "description": "Sends the first 300 characters (redacted) of each failed call's error, so a summary can tell an expected failure from a real one. Off: only the call is named.",
       "default": true
     },
     "maxCalls": {
