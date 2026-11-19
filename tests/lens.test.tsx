@@ -111,13 +111,15 @@ type Fake = {
   hooks?: unknown
   /** The settings keys the mod read. */
   settingsRead?: string[]
+  /** The clock (ms); moved by a test to age calls out of the 24-hour window. */
+  now?: number
 }
 
 const answer = (summary: string, kind = 'new', category = 'code', relates: string | null = null) =>
   JSON.stringify({ summary, category, kind, relates })
 
 function engine(on: any, f: Fake) {
-  on('clock.now', () => ({ value: 1_800_000_000_000 }))
+  on('clock.now', () => ({ value: f.now ?? 1_800_000_000_000 }))
   on('ui.log', (_: unknown, e: { text: string }) => {
     f.logs.push(e.text)
 
@@ -1344,7 +1346,7 @@ test('parse: judgments only when asked, ids only as sent, a deviation only when 
   const dev = (d: object) => parse(verdictWith({ deviation: d }), CATS, check())?.deviation
   expect(dev({ rule, how: 'h', action: { call: 'c9' } })).toBeUndefined()
   // Word for word: a changed case is not a quote, while a line break read as a space still is.
-  expect(dev({ rule: 'push only after kris approves it', how: 'h', action: { call: 'c1' } })).toBeUndefined()
+  expect(dev({ rule: 'push only after the owner approves it', how: 'h', action: { call: 'c1' } })).toBeUndefined()
   expect(dev({ rule: 'Push only after\nthe owner approves it', how: 'h', action: { call: 'c1' } })?.toolId).toBe('tu1')
   expect(dev({ rule: 'Always deploy on Fridays please', how: 'h', action: { call: 'c1' } })).toBeUndefined()
   expect(dev({ rule, how: 'h', action: { quote: 'no need to wait' } })?.quote).toBe('no need to wait')
@@ -1622,4 +1624,257 @@ test('judgeRules off: no rules, no latest message, no ⚑/◇ asked', { options:
   expect(f.systems[0]).not.toContain('deviation')
   expect(f.sent[0]).not.toContain('private words')
   expect(f.settingsRead ?? []).toEqual([])
+})
+
+// ---- 0.5.3: the rolling call budget, the archive, clear ------------------------------------------------------
+
+const DAY = 24 * 3_600_000
+const T0 = 1_800_000_000_000
+const textOf = async ($: any, args = '') => ((await $.command.run(worklog(args))) as { text: string }).text
+const budgetLines = (f: Fake) => f.logs.filter(l => l.includes('summary budget used'))
+
+test('rolling cap: at maxCalls the rest wait, said once; 24 h later the newest resume on the next scan', { options: { maxCalls: 2 } }, async ($, on) => {
+  const f = fake({ now: T0 })
+  engine(on, f)
+  on('session.compact', (_: unknown, e: any) => ({ messages: e.messages }))
+  await $.session.start(START)
+  f.rows.push(say('a1', 'Step one.'), say('a2', 'Step two.'), say('a3', 'Step three.'), say('a4', 'Step four.'))
+  f.replies.push(answer('One'), answer('Two'))
+  await $.turn.complete(DONE)
+  await settle()
+  expect(f.calls).toBe(2)
+  let text = await textOf($)
+  expect(text).toContain('#3 · skipped (call cap reached)')
+  expect(text).toContain('#4 · skipped (call cap reached)')
+  expect(budgetLines(f).length).toBe(1)
+  expect(budgetLines(f)[0]).toMatch(/\(2 calls in 24 h\); resumes about \d\d:\d\d/)
+  // Still inside the window: a new step waits too, and the line is not said again.
+  f.now = T0 + DAY - 1
+  f.rows.push(say('a5', 'Step five.'))
+  await $.turn.complete(DONE)
+  await settle()
+  expect(f.calls).toBe(2)
+  expect(budgetLines(f).length).toBe(1)
+  // The first calls age out: room for 2, the newest two pending (#4, #5) run, oldest of them first; #3 waits. The
+  // scan that finds this is a compaction's: no new step, no turn boundary.
+  f.now = T0 + DAY + 1
+  f.replies.push(answer('Four'), answer('Five'))
+  await $.session.compact({ trigger: 'auto', messages: [prompt('c0', 's')] } as any)
+  for (let i = 0; i < 4; i++) await settle()
+  expect(f.calls).toBe(4)
+  expect(f.sent[2]).toContain('Step four.')
+  expect(f.sent[3]).toContain('Step five.')
+  text = await textOf($)
+  expect(text).toContain('#4 ◆ code · Four')
+  expect(text).toContain('#5 ◆ code · Five')
+  expect(text).toContain('#3 · skipped (call cap reached)')
+})
+
+test('rolling cap: a turn end and a refill at once never overspend, and no queued step is left without a worker', { options: { maxCalls: 2 } }, async ($, on) => {
+  const f = fake({ now: T0 })
+  engine(on, f)
+  await $.session.start(START)
+  f.rows.push(say('a1', 'Step one.'), say('a2', 'Step two.'), say('a3', 'Step three.'), say('a4', 'Step four.'))
+  await $.turn.complete(DONE)
+  await settle()
+  f.rows.push(say('a5', 'Step five.'))
+  await $.turn.complete(DONE)
+  await settle()
+  expect(f.calls).toBe(2)
+  // A turn end with nothing new: its boundary starts the worker while the scan refills.
+  f.now = T0 + DAY + 1
+  await $.turn.complete(DONE)
+  for (let i = 0; i < 4; i++) await settle()
+  expect(f.calls).toBe(4)
+  expect(f.sent[2]).toContain('Step four.')
+  expect(f.sent[3]).toContain('Step five.')
+})
+
+test('rolling cap: a reload after the window passed resumes the waiting steps', { options: { maxCalls: 1 } }, async ($, on) => {
+  const f = fake({ now: T0 })
+  engine(on, f)
+  await $.session.start(START)
+  f.rows.push(say('a1', 'Step one.'), say('a2', 'Step two.'))
+  f.replies.push(answer('One'), answer('Two'))
+  await $.turn.complete(DONE)
+  await settle()
+  expect(f.calls).toBe(1)
+  f.now = T0 + DAY + 1
+  await $.session.start(START)
+  for (let i = 0; i < 4; i++) await settle()
+  expect(f.calls).toBe(2)
+  expect(await textOf($)).toContain('#2 ◆ code · Two')
+})
+
+test('/worklog summarize: 45 earlier steps drain in batches of at most 20, every one summarized', async ($, on) => {
+  const old = Array.from({ length: 45 }, (_, i) => say(`h${i + 1}`, `Old work ${i + 1}.`))
+  const f = fake({ rows: [prompt('p0', 'start'), ...old] })
+  engine(on, f)
+  await $.session.start(START)
+  await settle()
+  expect(f.calls).toBe(0)
+  const said = await textOf($, 'summarize')
+  expect(said).toContain('summarizing 20 skipped steps now; 25 more as the queue empties')
+  for (let i = 0; i < 4; i++) await settle()
+  expect(f.calls).toBe(45)
+  // The newest 20 were asked for first.
+  expect(f.sent[0]).toContain('Old work 26.')
+  expect(await textOf($)).not.toContain('skipped')
+})
+
+test('a pending step the queue bound drops keeps its place: nothing asked for is lost', async ($, on) => {
+  const old = Array.from({ length: 25 }, (_, i) => say(`h${i + 1}`, `Old work ${i + 1}.`))
+  const f = fake({ rows: [prompt('p0', 'start'), ...old] })
+  engine(on, f)
+  await $.session.start(START)
+  let release: (v: unknown) => void = () => undefined
+  f.replies.push(() => new Promise(r => (release = r)))
+  await $.command.run(worklog('summarize'))
+  await settle()
+  // One call held open, 19 queued; three new steps push the queue over 20, so its two oldest give way.
+  f.rows.push(say('a1', 'New one.'), say('a2', 'New two.'), say('a3', 'New three.'))
+  await $.turn.complete(DONE)
+  await settle()
+  expect(await textOf($)).not.toContain('queue full')
+  release({ isAnswered: true, text: answer('Held') })
+  for (let i = 0; i < 4; i++) await settle()
+  expect(f.calls).toBe(28)
+  expect(await textOf($)).not.toContain('skipped')
+})
+
+const PANE_UI = {
+  plugin: 'work-lens',
+  component: 'Pane',
+  requestId: 'work-log',
+  surface: 'terminal',
+  viewport: FULL,
+  props: { title: 'Work log', isFocused: false },
+} as any
+
+/**
+ * Twelve steps: #1 an open failure (⚠), #2 the end of a turn that asks a question nobody has answered (❗),
+ * then a turn the person did not start with #3–#12 plain work (#4 notes, #5 a fix).
+ */
+async function twelve($: any, on: any) {
+  const f = fake()
+  engine(on, f)
+  on('ui.render', { plugin: '*' }, original)
+  await $.session.start(START)
+  f.rows.push(say('a1', 'Running the tests.', [use('t1')]), failedResult('u1', 't1', 'FAIL x.test.ts'), say('a2', 'Which option do you want?'))
+  f.replies.push(answer('Did 1'), asking('Did 2'))
+  await $.turn.complete(DONE)
+  await settle()
+  f.rows.push(...Array.from({ length: 10 }, (_, i) => say(`a${i + 3}`, `Plain work ${i + 3}.`)))
+  f.replies.push(...Array.from({ length: 10 }, (_, i) => answer(`Did ${i + 3}`, i === 2 ? 'fix' : 'new', i === 1 ? 'notes' : 'code')))
+  await $.turn.complete(DONE)
+  await settle()
+
+  return f
+}
+
+test('archive: older steps fold into a block line; the critical ones stay rows; a press opens it', { options: { keepRecent: 5 } }, async ($, on) => {
+  await twelve($, on)
+  const text = await textOf($)
+  expect(text).toContain('· 12 steps')
+  expect(text).toContain('▸ block 1 · #1–7 · 7 steps · code 6 · notes 1 · ✚ 1 · ❗ 1 · ⚠ 1')
+  // #1 (⚠) and #2 (❗) stay rows; #3–#7 are folded; #8–#12 are the recent rows.
+  expect(text).toContain('#1 ')
+  expect(text).toContain('#2 ')
+  for (const n of [3, 4, 5, 6, 7]) expect(text).not.toContain(`#${n} `)
+  for (const n of [8, 9, 10, 11, 12]) expect(text).toContain(`#${n} `)
+  // One block listed whole; a block that does not exist is named.
+  const block = await textOf($, 'block 1')
+  for (const n of [1, 2, 3, 4, 5, 6, 7]) expect(block).toContain(`#${n} `)
+  expect(block).not.toContain('#8 ')
+  expect(await textOf($, 'block 2')).toContain('no block 2 (blocks: 1)')
+  // A filter shrinks the block to its matching steps (a waiting question passes every filter).
+  expect(await textOf($, 'fix')).toContain('· 2 steps')
+  await $.command.run(worklog('code'))
+  expect(await textOf($)).toContain('▸ block 1 · #1–7 · 6 steps · code 6')
+  // Old stays old under a narrow filter (fewer matches than keepRecent): #4 is still in block 1.
+  await $.command.run(worklog('notes'))
+  const notes = await textOf($)
+  expect(notes).toContain('▸ block 1 · #2–4 · 2 steps · code 1 · notes 1 · ❗ 1')
+  expect(notes).not.toContain('#4 ◆')
+  expect(await textOf($, 'block 1')).toContain('#4 ◆ notes · Did 4')
+  await $.command.run(worklog('all'))
+  // The pane: the block line, pressed open, lists its steps.
+  const ui = await $.ui.mount(PANE_UI)
+  const lines = async () => (await ui.findAll({ type: 'Button' })).map((b: any) => b.text as string).join('\n')
+  expect(await lines()).toContain('▸ #1–7 · 7 steps')
+  expect(await lines()).not.toContain('#4 ')
+  await ui.press({ key: 'b-1' })
+  expect(await lines()).toContain('▾ #1–7')
+  expect(await lines()).toContain('#4 ')
+  expect((await ui.findAll({ type: 'Text' })).map((t: any) => t.text).join('\n')).toContain('calls in the last 24 h')
+  await ui.unmount()
+  // A short pane with the block open: the opened rows are cut, the ⚠ and ❗ rows never are.
+  const small = await $.ui.mount({ ...PANE_UI, viewport: { columns: 120, rows: 10, isFullscreen: true } })
+  const smallText = (await small.findAll({ type: 'Button' })).map((b: any) => b.text as string).join('\n')
+  expect(smallText).toContain('#1 ⚠')
+  expect(smallText).toContain('#2 ❗')
+  expect(smallText).not.toContain('#6 ')
+  await small.unmount()
+})
+
+test('a short pane always draws the ⚠ and ❗ rows, even among the recent steps', async ($, on) => {
+  await twelve($, on)
+  const ui = await $.ui.mount({ ...PANE_UI, viewport: { columns: 120, rows: 10, isFullscreen: true } })
+  const text = (await ui.findAll({ type: 'Button' })).map((b: any) => b.text as string).join('\n')
+  expect(text).toContain('#1 ⚠')
+  expect(text).toContain('#2 ❗')
+  expect(text).toContain('#12 ')
+  expect(text).not.toContain('#5 ')
+  await ui.unmount()
+})
+
+test('/worklog clear: old finished entries leave the log; the critical stay; the transcript and failures are unchanged', { options: { keepRecent: 5 } }, async ($, on) => {
+  await twelve($, on)
+  const before = await header($, 'a4', 'Plain work 4.')
+  expect(await textOf($, 'clear')).toContain('cleared 5 entries #3–7 from the log; kept 2 open (⚠ f1, ❗ #2). The transcript is unchanged')
+  await $.command.run(worklog('all'))
+  const text = await textOf($)
+  expect(text).toContain('· 7 steps')
+  for (const n of [3, 4, 5, 6, 7]) expect(text).not.toContain(`#${n} `)
+  // The cleared step's header draws exactly as before; the failure is still open.
+  expect(await header($, 'a4', 'Plain work 4.')).toEqual(before)
+  expect(await textOf($, 'unresolved')).toContain('#1 ◆ code · Did 1 · ⚠ unresolved: f1')
+  await $.command.run(worklog('all'))
+  // The band counts only what is in the log.
+  const ui = await $.ui.mount(BAND)
+  expect((await ui.findAll({ type: 'Text' })).map((t: any) => t.text).join('')).toContain('all 7')
+  await ui.unmount()
+  // clear all: only the critical ones are left; a second clear finds nothing; summarize never asks for cleared steps.
+  expect(await textOf($, 'clear all')).toContain('cleared 5 entries #8–12 from the log')
+  expect(await textOf($, 'all')).toContain('· 2 steps')
+  expect(await textOf($, 'clear all')).toContain('nothing to clear (2 entries in the log)')
+  expect(await textOf($, 'summarize')).toContain('summarizing 0 skipped steps now')
+})
+
+test('a cleared step that gains a late failure comes back into the log and is asked again', async ($, on) => {
+  const f = fake()
+  engine(on, f)
+  on('session.compact', (_: unknown, e: any) => ({ messages: e.messages }))
+  await $.session.start(START)
+  f.rows.push(say('a1', 'Pushing.', [use('t1', 'Bash', bash('git push'))]), say('a2', 'Waiting for it.'))
+  f.replies.push(answer('Pushed'), answer('Waited'))
+  await $.session.compact({ trigger: 'auto', messages: [prompt('c0', 's')] } as any)
+  await settle()
+  expect(await textOf($, 'clear all')).toContain('cleared 2 entries #1–2')
+  f.rows.push(failedResult('u1', 't1', 'rejected: non-fast-forward'), say('a3', 'Looking at the rejection.'))
+  f.replies.push(answer('Looked at it'), answer('Pushed'))
+  await $.turn.complete(DONE)
+  await settle()
+  const text = await textOf($)
+  expect(text).toContain('· 2 steps')
+  expect(text).toContain('#1 ')
+  expect(text).not.toContain('#2 ')
+  expect(f.sent.filter(p => p.includes("This step's own failures")).length).toBe(1)
+  // Back for good: once its failure is fixed, it stays in the log (it is no longer cleared).
+  f.rows.push(say('a4', 'Pulling and pushing again.', [use('t4', 'Bash', bash('git pull --rebase'))]), okResult('u4', 't4'))
+  f.replies.push(verdictWith({ kind: 'fix', fixes: ['f1'] }))
+  await $.turn.complete(DONE)
+  for (let i = 0; i < 4; i++) await settle()
+  expect(await textOf($, 'unresolved')).toContain('· 0 steps')
+  expect(await textOf($, 'all')).toContain('#1 ')
 })

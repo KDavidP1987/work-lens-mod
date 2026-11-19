@@ -65,6 +65,11 @@ export type Step = {
   assumption?: string
   /** Successful results in this step whose calls closed in an earlier read: those calls are marked seen. */
   seenEarlier?: string[]
+  /**
+   * `/worklog clear` took the step out of the log: its bulky fields are dropped, its rows stay owned (the
+   * transcript header and folding are unchanged), and it is never summarized again.
+   */
+  isCleared?: true
 }
 
 declare module 'claude-code' {
@@ -76,8 +81,13 @@ declare module 'claude-code' {
       filter: string
       /** Steps the person expanded (or, with collapse off, collapsed): step id -> true. */
       toggled: Record<string, true>
-      /** Calls tried and calls answered this session. */
-      calls: { tried: number; answered: number }
+      /**
+       * Calls tried and calls answered this session, and the instants of the attempts in the last 24 hours (the
+       * rolling budget; absent in a state from before 0.5.3).
+       */
+      calls: { tried: number; answered: number; times?: number[] }
+      /** Archived blocks of old steps opened in the pane: block number -> true. */
+      openBlocks: Record<string, true>
       /** The uuid of the last row already split into closed steps; null before the first scan. */
       anchor: string | null
       /** Whether the rows from before the mod started have been listed (as collapsed "earlier history" steps). */

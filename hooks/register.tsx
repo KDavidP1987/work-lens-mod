@@ -32,6 +32,10 @@ import type { Failure, RuleSource } from './marks'
 
 const PANE = 'work-log'
 const QUEUE_MAX = 20
+/** The call budget's window: `maxCalls` attempts per rolling 24 hours. */
+const CALL_WINDOW_MS = 24 * 3_600_000
+/** Steps older than the newest `keepRecent` fold into blocks of this many (by step number). */
+const BLOCK_SIZE = 100
 const DEBOUNCE_MS = 10_000
 const PLAN_TTL_MS = 60_000
 const PLAN_MAX = 8000
@@ -184,7 +188,86 @@ function badge(step: Step, newest: string | undefined, Text: any) {
 const steps = atom({ plugin: 'work-lens', key: 'steps' } as const, [])
 const filter = atom({ plugin: 'work-lens', key: 'filter' } as const, 'all')
 const toggled = atom({ plugin: 'work-lens', key: 'toggled' } as const, {})
-const calls = atom({ plugin: 'work-lens', key: 'calls' } as const, { tried: 0, answered: 0 })
+const calls = atom({ plugin: 'work-lens', key: 'calls' } as const, { tried: 0, answered: 0, times: [] })
+const openBlocks = atom({ plugin: 'work-lens', key: 'openBlocks' } as const, {})
+
+/**
+ * The attempts still inside the rolling window, pruned by age only. A state from before 0.5.3 (no `times`) or a
+ * malformed one reads as none: earlier attempts do not count toward the first window.
+ */
+const inWindow = (times: unknown, now: number): number[] =>
+  (Array.isArray(times) ? times : []).filter((t): t is number => typeof t === 'number' && Number.isFinite(t) && now - t < CALL_WINDOW_MS)
+
+/** A step that must never fold away or be cleared: an open ⚠ failure, or a question not yet replied to. */
+const isCritical = (s: Step, open: ReadonlySet<string>) => open.has(s.id) || isWaiting(s)
+
+/**
+ * Queues skipped steps, newest first, as far as the queue and the call budget allow: `min(QUEUE_MAX − queued,
+ * budget room)`. They then run in list order. Returns how many were queued and how many such steps are left.
+ */
+async function requeue($: Engine, isEligible: (s: Step) => boolean) {
+  const now = await $.clock.now()
+  const room = S.maxCalls - inWindow((await read($, calls)).times, now).length
+  let queued = 0
+  let left = 0
+  await update($, steps, list => {
+    // Each queued or running step will spend at least one call: they come off the budget room as well as the
+    // queue's, so two refills at once (a scan's and the worker's) never queue more than the budget allows.
+    const busy = list.filter(s => s.status === 'queued' || s.status === 'running').length
+    const slots = Math.max(0, Math.min(room, QUEUE_MAX) - busy)
+    // A cleared step has lost its text: it is never asked for again.
+    const eligible = list.filter(s => s.isCleared !== true && isEligible(s))
+    const pick = new Set(slots === 0 ? [] : eligible.slice(-slots).map(s => s.id))
+    queued = pick.size
+    left = eligible.length - queued
+
+    // The note rides along while queued (only a skipped step's note is read): if the queue later drops the step,
+    // it goes back to waiting as it was.
+    return queued === 0 ? list : list.map(s => (pick.has(s.id) ? mark(s, 'queued', s.note) : s))
+  })
+  return { queued, left, room }
+}
+
+/** Waiting to be summarized again: skipped by the cap, or asked for with `/worklog summarize`. */
+const isPendingNote = (note: string | undefined) => note === 'call cap reached' || note === ASKED
+const isPending = (s: Step) => s.status === 'skipped' && isPendingNote(s.note)
+/** The note of a skipped step `/worklog summarize` asked for, queued as room allows. */
+const ASKED = 'asked for'
+
+/** No attempt is left in the rolling window. */
+async function isCapped($: Engine) {
+  return inWindow((await read($, calls)).times, await $.clock.now()).length >= S.maxCalls
+}
+
+/** Says once, until the budget has room again, that it ran out and about when it comes back (local time). */
+async function logCap($: Engine) {
+  if (S.isCapLogged) return
+  S.isCapLogged = true
+  const now = await $.clock.now()
+  const times = inWindow((await read($, calls)).times, now).sort((a, b) => a - b)
+  // Room comes back when enough of the oldest attempts age out to bring the count under the cap.
+  const freeAt = times[times.length - S.maxCalls]
+  const when = freeAt === undefined ? '' : `; resumes about ${clockTime(freeAt + CALL_WINDOW_MS)}`
+  $.ui.log(`work-lens: summary budget used (${S.maxCalls} calls in 24 h)${when}. Raise maxCalls in /config.`)
+}
+
+const clockTime = (ms: number) => {
+  const d = new Date(ms)
+
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+/**
+ * The rolling budget has room again: the pending steps (skipped by the cap, or asked for) are queued, newest
+ * first, and the work starts. Runs on every scan, at session start, and each time the queue empties.
+ */
+async function resumeCapped($: Engine) {
+  const r = await requeue($, isPending)
+  if (r.room > 0) S.isCapLogged = false
+  if (r.queued > 0) void work($)
+
+  return r
+}
 const anchor = atom({ plugin: 'work-lens', key: 'anchor' } as const, null)
 const backfilled = atom({ plugin: 'work-lens', key: 'backfilled' } as const, false)
 const failSeq = atom({ plugin: 'work-lens', key: 'failSeq' } as const, 0)
@@ -199,7 +282,11 @@ const S = {
   model: 'haiku',
   isAuto: true,
   isCollapsedByDefault: true,
-  maxCalls: 200,
+  maxCalls: 1000,
+  /** `keepRecent`: the newest steps listed one per row; older ones fold into blocks. */
+  keepRecent: 300,
+  /** The cap's log line is said once per time the budget runs out. */
+  isCapLogged: false,
   isEnded: false,
   scanning: null as Promise<void> | null,
   cont: undefined as Continuation | undefined,
@@ -477,6 +564,8 @@ async function recordRest($: Engine) {
 }
 
 async function enqueue($: Engine, closed: Step[]) {
+  // Every scan passes here, with or without new steps: the steps the cap skipped resume once the window has room.
+  await resumeCapped($)
   if (closed.length === 0) return
   let seq = await read($, failSeq)
   await update($, steps, list => {
@@ -517,7 +606,8 @@ async function enqueue($: Engine, closed: Step[]) {
         if (t.fail === undefined || !isCarrier(t)) continue
         const at = out.slice(0, listedCount).findIndex(o => o.tools.some(x => x.id === t.id && !isCarrier(x)))
         if (at < 0) continue
-        const owner = out[at]!
+        // A cleared step that gains a failure comes back into the log (all its fields were kept): it needs a look.
+        const { isCleared: _wasCleared, ...owner } = out[at]!
         out[at] = {
           // Summarized before the failure was known: asked again (one call), so `expected` is judged. One in flight
           // is asked again when it lands (work() compares its failures).
@@ -544,7 +634,8 @@ async function enqueue($: Engine, closed: Step[]) {
     if (over > 0) {
       const drop = new Set(waiting.slice(0, over).map(s => s.id))
 
-      return out.map(s => (drop.has(s.id) ? mark(s, 'skipped', 'queue full') : s))
+      // A pending step (asked for, or resumed after the cap) keeps its place in the pending pool.
+      return out.map(s => (drop.has(s.id) ? mark(s, 'skipped', isPendingNote(s.note) ? s.note : 'queue full') : s))
     }
 
     return out
@@ -588,12 +679,18 @@ async function work($: Engine) {
     for (;;) {
       if (S.isEnded) return
       const next = (await read($, steps)).find(s => s.status === 'queued')
-      if (next === undefined) return
-      if ((await read($, calls)).tried >= S.maxCalls) {
+      if (next === undefined) {
+        // The queue is empty: refill it from the pending steps while the budget has room (the guard above keeps
+        // this loop the only worker, so the `work()` that refill starts returns at once).
+        if ((await resumeCapped($)).queued > 0) continue
+
+        return
+      }
+      if (await isCapped($)) {
         await update($, steps, list =>
           list.map(s => (s.status === 'queued' ? mark(s, 'skipped', 'call cap reached') : s)),
         )
-        $.ui.log(`work-lens: stopped summarizing at the cap of ${S.maxCalls} calls (raise it in /config)`)
+        await logCap($)
 
         return
       }
@@ -606,7 +703,7 @@ async function work($: Engine) {
         await update($, steps, list =>
           list.map(s => (s.status === 'queued' || s.id === next.id ? mark(s, 'skipped', 'call cap reached') : s)),
         )
-        $.ui.log(`work-lens: stopped summarizing at the cap of ${S.maxCalls} calls (raise it in /config)`)
+        await logCap($)
 
         return
       }
@@ -647,6 +744,14 @@ async function work($: Engine) {
     }
   } finally {
     S.isWorking = false
+    // A scan or a refill may have queued steps while this loop was finishing (its `work()` returned at once, as
+    // this one still held the guard): look once more, so no queued step is left without a worker. At the cap the
+    // queue was emptied before returning, so this does not spin.
+    if (!S.isEnded) {
+      void read($, steps)
+        .then(list => (list.some(s => s.status === 'queued') ? work($) : undefined))
+        .catch(() => undefined)
+    }
   }
 }
 
@@ -666,9 +771,11 @@ async function summarize(
   const system = built.rules !== undefined ? [{ text: `${built.rules}\n\n`, cache: true as const }, { text: built.system }] : built.system
   for (let attempt = 0; attempt < 2; attempt++) {
     if (S.isEnded) return null
-    if ((await read($, calls)).tried >= S.maxCalls) return attempt === 0 ? 'cap' : null
+    if (await isCapped($)) return attempt === 0 ? 'cap' : null
     S.stop = new AbortController()
-    await update($, calls, c => ({ ...c, tried: c.tried + 1 }))
+    const at = await $.clock.now()
+    // Pruned by age only, never by the setting: a lowered `maxCalls` still sees every recent attempt.
+    await update($, calls, c => ({ ...c, tried: c.tried + 1, times: [...inWindow(c.times, at), at] }))
     const r = await $.model
       .complete({ model: S.model, system, prompt, maxTokens: 300, effort: 'low', timeoutMs: 60_000 }, { signal: S.stop.signal })
       .catch(() => null)
@@ -791,6 +898,139 @@ function toggle($: Engine, id: string) {
   })
 }
 
+// ---- long sessions: the archive and clear -----------------------------------------------------------------
+
+/** In the log: not cleared, or critical (an open ⚠ or a waiting ❗ is never out of view). */
+const isInLog = (s: Step, open: ReadonlySet<string>) => s.isCleared !== true || isCritical(s, open)
+
+type Block = { b: number; steps: Step[] }
+
+/**
+ * How the log is laid out under a filter: the newest `keepRecent` steps one per row; the older ones folded into
+ * blocks of BLOCK_SIZE by step number (block 1 = #1–100), with the critical ones among them also drawn as rows
+ * (`pinned`), above the blocks. Failures are worked out from every step, cleared ones included.
+ */
+function layout(list: readonly Step[], f: string) {
+  const open = openOf(list)
+  // Old and recent are decided on the log itself, before the filter: a filter never turns old steps recent.
+  const logged = list.filter(s => isInLog(s, open))
+  const recentIds = new Set(logged.slice(-S.keepRecent).map(s => s.id))
+  const shown = logged.filter(s => passes(s, f, open))
+  const old = shown.filter(s => !recentIds.has(s.id))
+  const byBlock = new Map<number, Step[]>()
+  for (const s of old) {
+    const b = Math.floor(Math.max(0, (s.n ?? 1) - 1) / BLOCK_SIZE) + 1
+    byBlock.set(b, [...(byBlock.get(b) ?? []), s])
+  }
+  const blocks: Block[] = [...byBlock.entries()].sort((a, b) => a[0] - b[0]).map(([b, steps]) => ({ b, steps }))
+
+  // Every critical step is drawn first, old or recent, so no cut for room can hide it; `recent` holds the rest.
+  const pinned = shown.filter(s => isCritical(s, open))
+
+  return { open, shown, recent: shown.filter(s => recentIds.has(s.id) && !isCritical(s, open)), pinned, blocks }
+}
+
+/** A block's one line: its range, size, categories by count, then ✚ fixes, ⇪ outward, ❗ waiting, ⚠ open, ⚑. */
+function blockLine(block: Block, open: ReadonlySet<string>) {
+  const ns = block.steps.map(s => s.n ?? 0)
+  const cats = new Map<string, number>()
+  for (const s of block.steps) if (s.status === 'done' && s.category !== undefined) cats.set(s.category, (cats.get(s.category) ?? 0) + 1)
+  const count = (p: (s: Step) => boolean) => block.steps.filter(p).length
+  const marks: Array<[string, number]> = [
+    ['✚', count(s => s.status === 'done' && s.kind === 'fix')],
+    ['⇪', count(s => hasFlag(s, 'outward', open))],
+    ['❗', count(isWaiting)],
+    ['⚠', count(s => open.has(s.id))],
+    ['⚑', count(s => s.deviation !== undefined)],
+  ]
+  const size = block.steps.length
+
+  return [
+    `#${Math.min(...ns)}–${Math.max(...ns)}`,
+    `${size} step${size === 1 ? '' : 's'}`,
+    ...[...cats.entries()].sort((a, b) => b[1] - a[1]).map(([c, k]) => `${c} ${k}`),
+    ...marks.filter(([, k]) => k > 0).map(([m, k]) => `${m} ${k}`),
+  ].join(' · ')
+}
+
+/** Opens or closes a folded block in the pane. */
+async function toggleBlock($: Engine, b: number) {
+  await update($, openBlocks, o => {
+    const key = String(b)
+    if (o[key] !== true) return { ...o, [key]: true as const }
+    const { [key]: _closed, ...rest } = o
+
+    return rest
+  })
+}
+
+/** A step as one line of `/worklog` text. */
+function lineText(s: Step, fails: ReturnType<typeof failuresOf>) {
+  const why = flagText(s, fails)
+
+  return `#${s.n}${s.part > 1 ? ` (part ${s.part})` : ''} ${lineOf(s)}${why ? ` · ${why}` : ''}`
+}
+
+/** `/worklog block <n>`: every step of one folded block under the filter in use. */
+async function blockText($: Engine, b: number) {
+  const list = await read($, steps)
+  const L = layout(list, await read($, filter))
+  const block = L.blocks.find(x => x.b === b)
+  if (block === undefined) {
+    const have = L.blocks.length > 0 ? `blocks: ${L.blocks.map(x => x.b).join(', ')}` : 'nothing is folded yet'
+
+    return `work-lens: no block ${b} (${have}).`
+  }
+  const fails = failuresOf(list)
+
+  return [`work-lens · block ${b} · ${blockLine(block, L.open)}`, ...block.steps.map(s => lineText(s, fails))].join('\n')
+}
+
+/**
+ * `/worklog clear`: takes out of the log every finished step older than the newest `keepRecent` (`all`: every
+ * finished step), except the critical ones. Display only: the steps stay in state, so the transcript, headers,
+ * folding and failure ledger are unchanged, and nothing is summarized again.
+ */
+async function clearLog($: Engine, isAll: boolean) {
+  const isFinished = (s: Step) => s.status === 'done' || s.status === 'unavailable' || s.status === 'skipped'
+  // Everything is decided on the list the update hands over (the boundary, what is hidden, what is kept, the
+  // report), so a step that changed meanwhile (a late failure, say) is judged as it is now.
+  const hide = new Set<string>()
+  let list: readonly Step[] = []
+  let logged: Step[] = []
+  let critical: Step[] = []
+  let busy = 0
+  await update($, steps, l => {
+    list = l
+    const open = openOf(l)
+    logged = l.filter(s => s.isCleared !== true)
+    const older = new Set(logged.slice(0, isAll ? logged.length : Math.max(0, logged.length - S.keepRecent)).map(s => s.id))
+    critical = l.filter(s => older.has(s.id) && isCritical(s, open))
+    busy = l.filter(s => older.has(s.id) && !isFinished(s)).length
+    for (const s of l) if (older.has(s.id) && isFinished(s) && !isCritical(s, open)) hide.add(s.id)
+
+    return hide.size === 0 ? l : l.map(s => (hide.has(s.id) ? { ...s, isCleared: true as const } : s))
+  })
+  if (hide.size === 0) {
+    const how = isAll ? '' : ` The newest ${S.keepRecent} stay; /worklog clear all takes those too.`
+
+    return `work-lens: nothing to clear (${logged.length} entries in the log).${how}`
+  }
+  const ns = list.filter(s => hide.has(s.id)).map(s => s.n ?? 0)
+  const fails = failuresOf(list).filter(x => x.isOpen)
+  const keptWhat = critical.flatMap(s => [
+    ...fails.filter(x => x.stepId === s.id).map(x => `⚠ ${x.id}`),
+    ...(isWaiting(s) ? [`❗ #${s.n}`] : []),
+  ])
+  const kept = critical.length > 0 ? `; kept ${critical.length} open (${keptWhat.join(', ')})` : ''
+  const still = busy > 0 ? `; ${busy} being summarized stay` : ''
+
+  return (
+    `work-lens: cleared ${hide.size} entr${hide.size === 1 ? 'y' : 'ies'} #${Math.min(...ns)}–${Math.max(...ns)} from the log${kept}${still}. ` +
+    'The transcript is unchanged; there is no undo.'
+  )
+}
+
 // ---- registration -----------------------------------------------------------------------------------------
 
 export const register: Register = (on, options) => {
@@ -798,6 +1038,8 @@ export const register: Register = (on, options) => {
   const reserved = new Set([
     'all',
     'summarize',
+    'clear',
+    'block',
     'unconfirmed',
     ...MARKS,
     ...FLAGS,
@@ -837,15 +1079,23 @@ export const register: Register = (on, options) => {
     .map(c => c.trim().toLowerCase())
     .filter(c => lower.includes(c))
     .map(c => S.categories[lower.indexOf(c)]!)
-  S.maxCalls = Math.max(1, Number(options.maxCalls ?? 200))
+  // A value that is not a positive number falls back to the default.
+  const posInt = (v: unknown, dflt: number) => {
+    const n = Math.floor(Number(v ?? dflt))
+
+    return Number.isFinite(n) && n >= 1 ? n : dflt
+  }
+  S.maxCalls = posInt(options.maxCalls, 1000)
+  S.keepRecent = posInt(options.keepRecent, 300)
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     S.isEnded = false
     await $.command.register({
       name: 'worklog',
-      description: 'work-lens: open the Work log, filter steps, or summarize skipped ones',
-      argumentHint: '[all|needs|review|purpose|work|input|report|unresolved|outward|deviation|assumption|planned|new|fix|<category>|summarize]',
+      description: 'work-lens: open the Work log, filter steps, summarize skipped ones, or clear old entries',
+      argumentHint:
+        '[all|needs|review|purpose|work|input|report|unresolved|outward|deviation|assumption|planned|new|fix|<category>|summarize|clear [all]|block <n>]',
     })
     if (S.badPatterns.length > 0) {
       $.ui.log(`work-lens: outwardPatterns left out (not a valid pattern): ${S.badPatterns.join(', ')}`)
@@ -861,6 +1111,8 @@ export const register: Register = (on, options) => {
     }
     if ((await read($, anchor)) === null) await setAnchorToNewest($)
     await backfill($).catch(() => undefined)
+    // Steps the cap skipped resume if the window passed while the mod was not loaded.
+    await resumeCapped($).catch(() => undefined)
     void work($)
 
     return result
@@ -875,9 +1127,11 @@ export const register: Register = (on, options) => {
       await update($, steps, () => [])
       await update($, anchor, () => null)
       await update($, backfilled, () => false)
-      await update($, calls, () => ({ tried: 0, answered: 0 }))
+      await update($, calls, () => ({ tried: 0, answered: 0, times: [] }))
       await update($, failSeq, () => 0)
       await update($, openGroup, () => null)
+      await update($, openBlocks, () => ({}))
+      S.isCapLogged = false
       S.cont = undefined
       S.latest = undefined
       // The new session's context brings its own files; nothing of the old one is sent.
@@ -979,13 +1233,24 @@ export const register: Register = (on, options) => {
     S.isFullscreen = e.presentation.isFullscreen
     const arg = e.args.trim().toLowerCase()
     if (arg === 'summarize') {
+      // Every skipped step is asked for (cap, queue full, earlier history, auto-summarize off), except those of a
+      // session that ended and cleared ones: queued newest first as the queue and the budget allow, the rest as
+      // the queue empties.
       await update($, steps, list =>
-        list.map(s => (s.status === 'skipped' && s.note !== 'session ended' ? mark(s, 'queued') : s)),
+        list.map(s =>
+          s.status === 'skipped' && s.note !== 'session ended' && s.isCleared !== true ? mark(s, 'skipped', ASKED) : s,
+        ),
       )
-      void work($)
+      const r = await resumeCapped($)
+      const left = r.left > 0 ? `; ${r.left} more as the queue empties` : ''
+      const wait = r.room <= 0 ? ' The summary budget is used up: they start when it has room again.' : ''
 
-      return { text: 'work-lens: summarizing the skipped steps now.' }
+      return { text: `work-lens: summarizing ${r.queued} skipped step${r.queued === 1 ? '' : 's'} now${left}.${wait}` }
     }
+    const clearMatch = /^clear(?:\s+(all))?$/.exec(arg)
+    if (clearMatch !== null) return { text: await clearLog($, clearMatch[1] === 'all') }
+    const blockMatch = /^block\s+(\d+)$/.exec(arg)
+    if (blockMatch !== null) return { text: await blockText($, Number(blockMatch[1])) }
     if (arg !== '') {
       const wanted = GROUP_ALIASES[arg] ?? arg
       const value = typedChoices().find(c => c.toLowerCase() === wanted)
@@ -1001,17 +1266,18 @@ export const register: Register = (on, options) => {
     }
     const f = await read($, filter)
     const all = await read($, steps)
-    const open = openOf(all)
     const fails = failuresOf(all)
-    const list = all.filter(s => passes(s, f, open))
-    const lines = list.slice(-40).map(s => {
-      const why = flagText(s, fails)
-
-      return `#${s.n}${s.part > 1 ? ` (part ${s.part})` : ''} ${lineOf(s)}${why ? ` · ${why}` : ''}`
-    })
+    const L = layout(all, f)
+    // Every critical step first, then the folded blocks (one line each; `/worklog block <n>` lists one), then the
+    // newest `keepRecent` rows.
+    const lines = [
+      ...L.pinned.map(s => lineText(s, fails)),
+      ...L.blocks.map(b => `▸ block ${b.b} · ${blockLine(b, L.open)}`),
+      ...L.recent.map(s => lineText(s, fails)),
+    ]
     const note = isHiddenFilter(f) ? ' (hidden group)' : ''
 
-    return { text: [`work-lens · filter: ${f}${note} · ${list.length} steps`, ...lines].join('\n') }
+    return { text: [`work-lens · filter: ${f}${note} · ${L.shown.length} steps`, ...lines].join('\n') }
   })
 
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
@@ -1048,16 +1314,18 @@ export const register: Register = (on, options) => {
   // The line above the prompt: every count is a filter. Press one to filter, press it again for all.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const list = await read($, steps)
-    if (e.props.hasSurvey || list.length === 0) return next(e)
+    const open = openOf(list)
+    // Cleared steps are out of the band (counts, hidden, kept); the failures are still worked out from all.
+    const logged = list.filter(s => isInLog(s, open))
+    if (e.props.hasSurvey || logged.length === 0) return next(e)
     const f = await read($, filter)
     const { Box, Button, Text } = $.ui.resolve(e)
     const busy = list.filter(s => s.status === 'queued' || s.status === 'running').length
     const waiting = list.filter(isWaiting).length
-    const open = openOf(list)
     const unresolved = failuresOf(list).filter(x => x.isOpen).length
-    const hidden = f === 'all' ? 0 : list.filter(s => !passes(s, f, open)).length
+    const hidden = f === 'all' ? 0 : logged.filter(s => !passes(s, f, open)).length
     // Steps with no summary pass every filter (never hidden unlabeled); the line says how many it kept, and why.
-    const kept = unsummarized(list)
+    const kept = unsummarized(logged)
     const og = await read($, openGroup)
     // Only the labels with steps, plus all, back, the groups and the one in use, so the line stays short.
     const chips = chipsFor(f, og).filter(i => i.type !== 'label' || i.choice === 'all' || i.choice === f || countFor(list, i.choice) > 0)
@@ -1084,12 +1352,47 @@ export const register: Register = (on, options) => {
     const list = await read($, steps)
     const f = await read($, filter)
     const used = await read($, calls)
-    const open = openOf(list)
+    const now = await $.clock.now()
     const fails = failuresOf(list)
-    const shown = list.filter(s => passes(s, f, open))
+    const L = layout(list, f)
+    const { open } = L
     const newest = newestTurnEnd(list)
     const room = Math.max(3, (e.viewport?.rows ?? 30) - 8)
     const og = await read($, openGroup)
+    const opened = await read($, openBlocks)
+    const row = (s: Step, key: string) => (
+      <Button key={key} plain onPress={() => toggle($, s.id)}>
+        <Text dimColor>{`#${s.n} `}</Text>
+        {badge(s, newest, Text)}
+        {flags(s, open, Text)}
+        <Mark step={s} Text={Text} />
+        {` ${restOf(s)}`}
+        {flagText(s, fails) !== '' && <Text dimColor>{`  ${flagText(s, fails)}`}</Text>}
+      </Button>
+    )
+    // On top: every critical step (always drawn, never cut), then each block's line (an opened
+    // one followed by its rows); the newest rows fill what room is left (at least 3).
+    const pinnedRows = L.pinned.map(s => row(s, `p-${s.id}`))
+    const blockRows = [
+      ...L.blocks.flatMap(b => {
+        const isOpen = opened[String(b.b)] === true
+        const line = (
+          <Button key={`b-${b.b}`} plain onPress={() => toggleBlock($, b.b)}>
+            <Text dimColor>{`${isOpen ? '▾' : '▸'} ${blockLine(b, open)}`}</Text>
+          </Button>
+        )
+
+        return isOpen ? [line, ...b.steps.filter(s => !isCritical(s, open)).map(s => row(s, `bs-${s.id}`))] : [line]
+      }),
+    ]
+    // Only block lines are cut for room; at least one is kept (or the note saying how many are not shown).
+    const blockRoom = Math.max(1, room - 3 - pinnedRows.length)
+    const cutBlocks =
+      blockRows.length > blockRoom
+        ? [...blockRows.slice(0, blockRoom - 1), <Text key="more" dimColor>{`… ${blockRows.length - blockRoom + 1} more lines (/worklog block <n>)`}</Text>]
+        : blockRows
+    const topShown = [...pinnedRows, ...cutBlocks]
+    const recentRoom = Math.max(3, room - topShown.length)
 
     return (
       <Box flexDirection="column">
@@ -1100,18 +1403,10 @@ export const register: Register = (on, options) => {
             </Button>
           ))}
         </Box>
-        <Text dimColor>{`${used.answered} summaries · ${used.tried}/${S.maxCalls} calls · model ${S.model}`}</Text>
-        {shown.length === 0 && <Text dimColor>No steps yet.</Text>}
-        {shown.slice(-room).map(s => (
-          <Button key={`s-${s.id}`} plain onPress={() => toggle($, s.id)}>
-            <Text dimColor>{`#${s.n} `}</Text>
-            {badge(s, newest, Text)}
-            {flags(s, open, Text)}
-            <Mark step={s} Text={Text} />
-            {` ${restOf(s)}`}
-            {flagText(s, fails) !== '' && <Text dimColor>{`  ${flagText(s, fails)}`}</Text>}
-          </Button>
-        ))}
+        <Text dimColor>{`${used.answered} summaries · ${inWindow(used.times, now).length}/${S.maxCalls} calls in the last 24 h · model ${S.model}`}</Text>
+        {L.shown.length === 0 && <Text dimColor>No steps yet.</Text>}
+        {topShown}
+        {L.recent.slice(-recentRoom).map(s => row(s, `s-${s.id}`))}
       </Box>
     )
   })
@@ -1131,12 +1426,13 @@ function holds(s: Step, choice: string, open: ReadonlySet<string>): boolean {
   return s.status === 'done' && isShown(s, choice, S.neutral)
 }
 
-/** How many steps hold a filter's label ('all' counts every step). */
+/** How many steps in the log hold a filter's label ('all' counts every one); cleared steps are not counted. */
 function countFor(list: readonly Step[], choice: string) {
-  if (choice === 'all') return list.length
   const open = openOf(list)
+  const logged = list.filter(s => isInLog(s, open))
+  if (choice === 'all') return logged.length
 
-  return list.filter(s => holds(s, choice, open)).length
+  return logged.filter(s => holds(s, choice, open)).length
 }
 
 /**
@@ -1152,8 +1448,9 @@ function unsummarized(list: readonly Step[]) {
     if (s.status === 'done' || s.status === 'queued' || s.status === 'running') continue
     const reason = s.status === 'unavailable' ? 'summary failed' : (s.note ?? 'skipped')
     why.set(reason, (why.get(reason) ?? 0) + 1)
-    // `/worklog summarize` asks for the skipped ones, except those of a session that ended.
-    if (s.status === 'skipped' && s.note !== 'session ended') canAsk += 1
+    // `/worklog summarize` asks for the skipped ones, except those of a session that ended; the pending ones (asked
+    // for, or waiting on the budget) come on their own.
+    if (s.status === 'skipped' && s.note !== 'session ended' && !isPendingNote(s.note)) canAsk += 1
   }
   const n = [...why.values()].reduce((a, b) => a + b, 0)
   if (n === 0) return ''

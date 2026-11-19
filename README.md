@@ -77,9 +77,27 @@ session went to repairs.
 
 Under a filter, steps without a summary stay in view, because they have no label to filter on. The line says how
 many there are and why: "earlier history" is work from before the mod started, which is never summarized unless
-you ask (`/worklog summarize`). The other reasons are the call cap, a full queue, a session that ended, or a
-summary that failed. Example: `· 100 without a summary, kept in view (92 earlier history, 8 call cap reached;
-/worklog summarize)`.
+you ask (`/worklog summarize`). The other reasons are the call budget (those resume on their own), a full queue,
+a session that ended, or a summary that failed. Example: `· 100 without a summary, kept in view (92 earlier
+history, 8 call cap reached; /worklog summarize)`.
+
+### Long sessions
+
+- **A rolling call budget.** `maxCalls` (default 1,000) caps the summary calls in any 24 hours, retries
+  included. A typical request of yours is about 20 steps, so 1,000 covers roughly 50 requests a day. When it
+  runs out, the log says so once, with the time it comes back. The steps that waited are then summarized on
+  their own, newest first, as the oldest calls age out.
+- **Old steps fold into blocks.** The pane and `/worklog` list the newest `keepRecent` steps (default 300) one
+  per row. Older ones fold into one line per 100 steps, for example
+  `▸ #1–100 · 100 steps · code 41 · notes 22 · ✚ 9 · ⇪ 3`. Press it to open it, or run `/worklog block 1`.
+  - An open ⚠ or a question still waiting on you (❗) always stays its own row.
+  - Counts and filters still cover every step.
+- **`/worklog clear`** takes every finished step older than the newest `keepRecent` out of the log: the pane,
+  `/worklog`, the blocks and the counts. `/worklog clear all` takes every finished step.
+  - Open ⚠, waiting ❗, and steps being summarized stay.
+  - It tidies the log only. The transcript, its fold headers and the failure record do not change, and no
+    memory is freed.
+  - There is no undo. A cleared step comes back by itself only if a late failure turns up for one of its calls.
 
 `labelGroups` picks the groups drawn at all. For example, `needs, work` hides ⇪/◇ and the purpose glyphs from
 rows, chips and `/worklog` lines. A hidden label still filters when typed (`/worklog outward`), marked
@@ -105,7 +123,9 @@ rows, chips and `/worklog` lines. A hidden label still filters when typed (`/wor
   question and decision, `/worklog report` every turn's report, and `/worklog unresolved|outward|deviation|assumption`
   the flagged steps with their reasons. In this layout a summary that asks for your input
   is logged with `❗ input needed` in front.
-- `/worklog summarize` summarizes the steps that were skipped (summaries off, queue full, call cap).
+- `/worklog summarize` summarizes the steps that were skipped (earlier history, summaries off, queue full, call
+  budget), newest first, 20 at a time, within the call budget.
+- `/worklog clear [all]` and `/worklog block <n>`: see Long sessions.
 
 `ctrl+o` shows tool rows in full as usual; the text of a collapsed step shows when you press its header.
 
@@ -122,7 +142,8 @@ within the newest 4,096 transcript rows (the most a mod can read by id).
 | `model` | haiku | haiku or sonnet |
 | `autoSummarize` | on | off: nothing is sent until `/worklog summarize` |
 | `collapseByDefault` | on | fullscreen headers start collapsed |
-| `maxCalls` | 200 | per session; every attempt counts, retries included |
+| `maxCalls` | 1000 | summary calls in any 24 hours (rolling); every attempt counts, retries included |
+| `keepRecent` | 300 | newest steps listed one per row; older ones fold into a line per 100 steps |
 | `labelDetail` | grouped | grouped: one chip per label group, opened by pressing; all: every label as a chip, value included (the layout before 0.5.1) |
 | `labelGroups` | needs, review, purpose, work | the label groups drawn (display only; an unknown name is logged) |
 | `outwardPatterns` | (none) | comma-separated regexes over a parsed command that also count as ⇪ |
@@ -133,7 +154,7 @@ within the newest 4,096 transcript rows (the most a mod can read by id).
 
 Each step is one extra model request (the default `haiku`, a few hundred tokens out), made through **your
 session's own API client and provider** and listed in `/cost`. Calls run one at a time, time out after 60 s,
-and stop at the cap. Each request carries:
+and pause when the 24-hour budget (`maxCalls`) is used. Each request carries:
 
 - the step's text, up to 4,000 characters (for a turn's last message, also the question whether it asks you
   for input now);

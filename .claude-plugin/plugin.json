@@ -1,6 +1,6 @@
 {
   "name": "work-lens",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Summarizes each step of work into a one-line, collapsible, filterable entry: category, plan item, and a planned / new / fix marker.",
   "author": { "name": "SkillEra IO, LLC" },
   "license": "MIT",
@@ -70,9 +70,15 @@
     },
     "maxCalls": {
       "type": "number",
-      "title": "Call cap per session",
-      "description": "Every model attempt counts, retries included.",
-      "default": 200
+      "title": "Summary calls per 24 hours",
+      "description": "A rolling budget: at most this many model attempts (retries included) in any 24 hours. Steps that wait for it are summarized, newest first, as the oldest calls age out.",
+      "default": 1000
+    },
+    "keepRecent": {
+      "type": "number",
+      "title": "Steps listed one per row",
+      "description": "The Work log pane and /worklog list this many of the newest steps; older ones fold into one line per 100 steps (press it, or /worklog block <n>, to see them). An open ⚠ or a waiting ❗ is always listed.",
+      "default": 300
     }
   }
 }
